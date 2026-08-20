@@ -61,7 +61,7 @@ DB_PATH = "quiz.db"
 try:
     ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 except Exception:
-    ADMIN_PASSWORD = "admin2424"  # <-- CHANGE ME
+    ADMIN_PASSWORD = "admin123"  # <-- CHANGE ME
 
 # --------------------------------------------------------------------------
 # DATA LAYER
@@ -600,12 +600,25 @@ def admin_dashboard():
 
 
 def admin_view():
-    tab1, tab2, tab3 = st.tabs(["➕ Create quiz", "✏️ Edit quiz", "📊 Dashboard"])
-    with tab1:
+    # Deliberately NOT using st.tabs() here: Streamlit executes the code
+    # behind every tab on every rerun (it only hides the inactive ones with
+    # CSS), which meant the Dashboard's auto-refresh kept firing in the
+    # background even while you were on the Edit tab — forcing a rerun
+    # mid-keystroke and making text inputs feel like they were rejecting
+    # input. A plain section picker only runs the code for the section
+    # you're actually looking at.
+    section = st.radio(
+        "Section",
+        ["➕ Create quiz", "✏️ Edit quiz", "📊 Dashboard"],
+        horizontal=True,
+        key="admin_section",
+    )
+    st.divider()
+    if section == "➕ Create quiz":
         admin_create_quiz()
-    with tab2:
+    elif section == "✏️ Edit quiz":
         admin_edit_quiz()
-    with tab3:
+    else:
         admin_dashboard()
 
 
