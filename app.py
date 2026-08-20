@@ -61,7 +61,7 @@ DB_PATH = "quiz.db"
 try:
     ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 except Exception:
-    ADMIN_PASSWORD = "admin123"  # <-- CHANGE ME
+    ADMIN_PASSWORD = "admin2424"  # <-- CHANGE ME
 
 # --------------------------------------------------------------------------
 # DATA LAYER
