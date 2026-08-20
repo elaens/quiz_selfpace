@@ -1,0 +1,161 @@
+# Team Quiz App — Self-Paced, Timed (Streamlit)
+
+A self-hosted, PowerApps/forms-style quiz. You (the **Admin**) prepare the
+questions once and set a turnaround time (default 60 minutes). You share a
+single link + join code with the whole team. Each person starts whenever
+suits them — their personal clock starts at that moment, runs for the full
+duration even if they close the tab, and their quiz auto-submits the instant
+their time is up. Every answer autosaves as they pick/type it, so nothing
+is lost if they get pulled away.
+
+Questions can be **multiple choice** (auto-graded) or **free text**
+(auto-graded against expected answers if you provide any, otherwise flagged
+for you to review manually).
+
+## 1. Install
+
+```bash
+pip install -r requirements.txt
+```
+
+## 2. Set your admin password (do this before sharing the link!)
+
+The admin area is hidden from participants — it only appears at a separate
+URL (`?admin=1`) and is password-gated. Set the password one of two ways:
+
+**Option A — quick/local testing:** edit `app.py` and change this line near
+the top:
+```python
+ADMIN_PASSWORD = "admin123"  # <-- CHANGE ME
+```
+
+**Option B — recommended for anything shared:** create
+`.streamlit/secrets.toml` next to `app.py`:
+```toml
+ADMIN_PASSWORD = "something-only-you-know"
+```
+This keeps the password out of the code entirely (and is how you'd set it
+on Streamlit Community Cloud too, via the app's Secrets settings).
+
+## 3. Run locally
+
+```bash
+streamlit run app.py
+```
+
+- **Participant link** (share this with the team): the base app URL, e.g.
+  `http://localhost:8501` — or with the join code prefilled:
+  `http://localhost:8501/?code=12345`. This view has no admin option
+  anywhere on it.
+- **Admin link** (keep this to yourself): `http://localhost:8501/?admin=1`
+  — asks for the password before showing any controls.
+
+## 4. Admin workflow
+
+Once logged in at the `?admin=1` link, there are three tabs:
+
+- **➕ Create quiz** — set title + turnaround time (minutes), add MCQ or
+  free-text questions one at a time, then Publish to get a join code.
+- **✏️ Edit quiz** — pick any existing quiz, change its title, duration, or
+  score-visibility setting, remove a question (🗑️ next to it) or add new
+  ones, then **Save changes**. If people have already started that quiz,
+  you'll see a warning: adding questions or fixing typos is safe, but
+  removing/reordering questions can shift what earlier answers line up
+  with — fine for a quiz that hasn't started yet, worth avoiding mid-flight.
+- **📊 Dashboard** — pick a quiz to see live status per participant (in
+  progress with time left / submitted / expired), auto-graded scores, a
+  "Full answer detail" expander with every response (including free-text
+  ones to grade manually) and CSV downloads for both the summary and the
+  detail view. At the bottom, a **Danger zone** lets you clear all results
+  for that quiz (attempts + answers) while keeping the quiz itself intact —
+  handy for a dry run before the real thing. It requires an explicit
+  confirmation checkbox and cannot be undone.
+
+## 5. Navigation & UI
+
+Participants move through questions one at a time with **Previous / Next**
+buttons — no free jumping around. The last question shows **✅ Final
+Submit** instead of Next; if anything's still unanswered at that point,
+it's flagged (but Final Submit still goes through, so no one gets stuck).
+
+Streamlit's default chrome — the hamburger menu, footer, and top-right
+toolbar (which includes the "view source" GitHub icon on apps deployed
+from a public repo) — is hidden via CSS on every page, so participants
+never see a way to peek at the underlying code.
+
+## 6. Question types
+
+- **Multiple choice** — 2 to 4 options, one marked correct. Auto-graded.
+- **Free text** — participant types their answer. Optionally give one or
+  more expected answers (comma-separated, case-insensitive exact match)
+  for auto-grading, e.g. `Paris, paris, city of light`. Leave it blank and
+  the question is simply collected for manual review — it won't count
+  toward the auto-graded score, but every response is visible in the
+  dashboard's detail view and CSV export.
+
+## 7. Let colleagues on the same network join
+
+If everyone is on the same office Wi-Fi:
+
+```bash
+streamlit run app.py --server.address 0.0.0.0
+```
+
+Then find your machine's local IP (e.g. `192.168.1.42`) and share
+`http://192.168.1.42:8501` as the participant link.
+
+## 8. Let remote colleagues join (no local network needed)
+
+The easiest free option is **Streamlit Community Cloud**:
+
+1. Push this folder to a GitHub repo.
+2. Go to https://share.streamlit.io, sign in with GitHub, and deploy the
+   repo. Add `ADMIN_PASSWORD` under the app's Secrets settings there
+   (same TOML format as step 2, Option B).
+3. Share the public participant URL (e.g.
+   `https://your-quiz.streamlit.app`) with the team, and keep
+   `https://your-quiz.streamlit.app/?admin=1` for yourself.
+
+Alternatively, a quick tunnel like `ngrok` or `cloudflared` works for a
+one-off session without deploying anywhere.
+
+## 9. Capturing answers & the 1-hour TAT
+
+Every answer is written to `quiz.db` (SQLite) the instant a participant
+picks or types it — not just on final submit — so nothing is lost if their
+browser crashes or they get pulled into a meeting.
+
+The turnaround time is enforced **per participant**, not globally:
+
+- Each person's `start_time` is stamped only once, the first time they
+  click "Start quiz."
+- Their deadline = `start_time + duration_minutes`.
+- If they close the tab and reopen the link hours later, the app recomputes
+  remaining time from their original `start_time` — it does not give them
+  a fresh 60 minutes.
+- The moment their remaining time hits zero (checked whenever they load the
+  page, or via the periodic auto-refresh while it's open), their attempt is
+  automatically marked "submitted" with whatever they'd answered so far.
+
+## 10. Notes & limits
+
+- `quiz.db` is created next to `app.py` on first run — delete it to reset
+  absolutely everything (all quizzes and all results). To reset just one
+  quiz's results and keep its questions, use the Dashboard's Danger zone
+  instead.
+- Auto-submit on timeout triggers when the participant's page is open (it
+  checks on every load and every auto-refresh tick). If someone starts and
+  never reopens the tab again before or after their deadline, their
+  attempt shows "time expired" on the dashboard but formally flips to
+  "submitted" the next time anyone touches that row. For strict
+  enforcement with zero user interaction, add a small scheduled job (e.g.
+  a cron task) that calls `mark_submitted` for any attempt whose deadline
+  has passed — the function is already in `app.py`.
+- This uses SQLite, which is fine for a single running app instance (one
+  `streamlit run` process, or one Streamlit Cloud app). If you need
+  multiple server instances behind a load balancer, swap the DB calls in
+  the "DATA LAYER" section of `app.py` for Postgres/MySQL.
+- The admin password gate is basic (a single shared password, checked
+  client-side against a string in your app/secrets) — fine for keeping
+  casual participants out of the admin view, not a substitute for real
+  auth if the quiz involves sensitive data.
