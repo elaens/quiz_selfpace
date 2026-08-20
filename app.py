@@ -1,32 +1,42 @@
 """
 Self-Paced Timed Quiz App (PowerApps-style) — Streamlit + SQLite.
-Supports two question types: multiple-choice (MCQ) and free text.
+Supports MCQ + free-text questions, per-participant timed turnaround,
+password-gated admin area, quiz editing, and results reset.
 
 Run with:
     streamlit run app.py
 
+Participant link (what you share with the team):
+    <your app URL>                      e.g. https://your-quiz.streamlit.app
+    or with the code prefilled:
+    <your app URL>/?code=12345
+
+Admin link (keep this one to yourself):
+    <your app URL>/?admin=1
+    You'll be asked for the admin password (see ADMIN_PASSWORD below, or
+    set it via Streamlit secrets — see README.md).
+
 Model
 -----
-- An ADMIN prepares a quiz (title, questions, and a turnaround time in
-  minutes — default 60) and gets back a short quiz CODE. Each question is
-  either MCQ (with a correct option) or FREE TEXT (with optional expected
-  answers for auto-grading; if left blank, the admin grades it manually).
-- The admin shares the app link + code with the team.
-- Each PARTICIPANT opens the link, enters the code + their name, and clicks
-  "Start". That click stamps THEIR OWN start_time in the database. From
-  that moment, they have `duration_minutes` (default 60) to finish, at
-  their own convenience — they can close the tab and come back; the timer
-  keeps counting from their original start_time, not from when they reopen.
-- Answers are saved the instant they're entered (no "lost progress" risk).
-- When a participant's personal timer hits zero, their quiz is locked and
-  auto-submitted, whatever they'd answered so far.
-- The admin gets a live dashboard: who has started, time remaining / status
-  for each person, auto-graded scores, free-text answers to review, and a
-  CSV export.
+- Only people who open the app with ?admin=1 AND enter the correct password
+  ever see admin controls. The normal participant link never shows an
+  "Admin" option — there is no sidebar role switcher.
+- An ADMIN prepares a quiz (title, questions, turnaround time in minutes —
+  default 60) and gets a short quiz CODE to share.
+- Each PARTICIPANT opens the link, enters the code + their name, clicks
+  "Start" — that stamps THEIR OWN start_time. From that moment they have
+  `duration_minutes` to finish, at their own convenience; closing the tab
+  and coming back does not reset the clock.
+- Answers save the instant they're entered. When a participant's personal
+  timer hits zero, their quiz auto-submits whatever they'd answered.
+- Admin dashboard: live status per participant, auto-graded scores, a
+  full answer detail view (including free-text responses to grade
+  manually), CSV export, and a "clear results" reset per quiz.
+- Admin can also edit a published quiz: title, duration, show-score
+  setting, and add/remove questions.
 
-Deployment note: state lives in a local SQLite file (quiz.db), which is
-fine for one running app instance (one `streamlit run` process, or one
-Streamlit Community Cloud app). See README.md for hosting options.
+Deployment note: state lives in a local SQLite file (quiz.db), fine for one
+running app instance. See README.md for hosting + securing the admin page.
 """
 
 import sqlite3
@@ -45,6 +55,13 @@ except ImportError:
     HAS_AUTOREFRESH = False
 
 DB_PATH = "quiz.db"
+
+# Change this before sharing the app, or set ADMIN_PASSWORD in
+# .streamlit/secrets.toml to avoid hardcoding it in code.
+try:
+    ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
+except Exception:
+    ADMIN_PASSWORD = "admin123"  # <-- CHANGE ME
 
 # --------------------------------------------------------------------------
 # DATA LAYER
@@ -106,6 +123,26 @@ def create_quiz(title, questions, duration_minutes, show_score):
     conn.commit()
     conn.close()
     return code
+
+
+def update_quiz(code, title, questions, duration_minutes, show_score):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE quizzes SET title = ?, questions_json = ?, duration_minutes = ?, show_score = ? "
+        "WHERE code = ?",
+        (title, json.dumps(questions), duration_minutes, int(show_score), code),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_results(code):
+    """Clears all attempts and answers for a quiz — the quiz itself stays."""
+    conn = get_conn()
+    conn.execute("DELETE FROM attempts WHERE quiz_code = ?", (code,))
+    conn.execute("DELETE FROM answers WHERE quiz_code = ?", (code,))
+    conn.commit()
+    conn.close()
 
 
 def get_quiz(code):
@@ -235,6 +272,24 @@ def autorefresh(interval_ms, key):
         st.button("🔄 Refresh timer", key=key + "_btn")
 
 
+def hide_streamlit_chrome():
+    """Hides the default Streamlit hamburger menu, footer, and the
+    top-right toolbar (which includes the GitHub / 'view source' icon on
+    apps deployed from a public repo). Covers selectors across recent
+    Streamlit versions since the internal class names shift between them."""
+    st.markdown("""
+        <style>
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        [data-testid="stToolbar"] {visibility: hidden !important; height: 0 !important;}
+        [data-testid="stDecoration"] {display: none !important;}
+        [data-testid="stStatusWidget"] {visibility: hidden !important;}
+        a[href*="github.com"] {display: none !important;}
+        </style>
+    """, unsafe_allow_html=True)
+
+
 # --------------------------------------------------------------------------
 # SCORING
 # --------------------------------------------------------------------------
@@ -245,19 +300,17 @@ def normalize(s):
 
 def grade_one(q, ans):
     """
-    Returns one of: True (correct), False (incorrect), None (needs manual
+    Returns True (correct), False (incorrect), or None (needs manual
     review — free text question with no expected answers on file).
-    `ans` is {'answer_index':.., 'answer_text':..} or None if unanswered.
     """
     if q["type"] == "mcq":
         if ans is None or ans.get("answer_index") is None:
             return False
         return ans["answer_index"] == q["correct_index"]
 
-    # free text
     expected = q.get("expected_answers") or []
     if not expected:
-        return None  # manual review only
+        return None
     if ans is None or not (ans.get("answer_text") or "").strip():
         return False
     given = normalize(ans["answer_text"])
@@ -266,9 +319,7 @@ def grade_one(q, ans):
 
 def score_attempt(questions, answers_dict):
     """Returns (correct, auto_gradable_total, manual_review_count)."""
-    correct = 0
-    auto_total = 0
-    manual = 0
+    correct, auto_total, manual = 0, 0, 0
     for i, q in enumerate(questions):
         result = grade_one(q, answers_dict.get(i))
         if result is None:
@@ -278,6 +329,78 @@ def score_attempt(questions, answers_dict):
             if result:
                 correct += 1
     return correct, auto_total, manual
+
+
+# --------------------------------------------------------------------------
+# SHARED QUESTION BUILDER WIDGET (used by both Create and Edit tabs)
+# --------------------------------------------------------------------------
+
+def question_builder(state_key, form_key_suffix):
+    """Renders the 'type + fields' form to append one question to
+    st.session_state[state_key] (a list)."""
+    q_type = st.radio("Question type", ["Multiple choice", "Free text"],
+                       horizontal=True, key=f"qtype_{form_key_suffix}")
+
+    with st.form(f"add_question_form_{form_key_suffix}", clear_on_submit=True):
+        st.markdown("**Add a question**")
+        q_text = st.text_area("Question text", key=f"qtext_{form_key_suffix}")
+
+        if q_type == "Multiple choice":
+            opt_a = st.text_input("Option A", key=f"a_{form_key_suffix}")
+            opt_b = st.text_input("Option B", key=f"b_{form_key_suffix}")
+            opt_c = st.text_input("Option C (optional)", key=f"c_{form_key_suffix}")
+            opt_d = st.text_input("Option D (optional)", key=f"d_{form_key_suffix}")
+            correct = st.selectbox("Correct answer", ["A", "B", "C", "D"], key=f"corr_{form_key_suffix}")
+        else:
+            expected_raw = st.text_input(
+                "Expected answer(s) for auto-grading — comma-separated, case-insensitive. "
+                "Leave blank to grade this one manually.",
+                key=f"exp_{form_key_suffix}",
+            )
+
+        add = st.form_submit_button("Add question")
+        if add:
+            if not q_text.strip():
+                st.error("Give the question text.")
+            elif q_type == "Multiple choice":
+                options = [o for o in [opt_a, opt_b, opt_c, opt_d] if o.strip()]
+                if len(options) < 2:
+                    st.error("Give at least 2 options.")
+                else:
+                    correct_index = "ABCD".index(correct)
+                    if correct_index >= len(options):
+                        st.error(f"Option {correct} is empty — pick a correct answer that has text.")
+                    else:
+                        st.session_state[state_key].append({
+                            "type": "mcq",
+                            "text": q_text,
+                            "options": options,
+                            "correct_index": correct_index,
+                        })
+                        st.success("Question added.")
+            else:
+                expected = [e.strip() for e in expected_raw.split(",") if e.strip()]
+                st.session_state[state_key].append({
+                    "type": "text",
+                    "text": q_text,
+                    "expected_answers": expected,
+                })
+                st.success("Question added." + ("" if expected else " (marked for manual grading)"))
+
+    if st.session_state[state_key]:
+        st.markdown(f"**Questions so far ({len(st.session_state[state_key])}):**")
+        for i, q in enumerate(st.session_state[state_key]):
+            cols = st.columns([8, 1])
+            with cols[0]:
+                if q["type"] == "mcq":
+                    st.write(f"{i+1}. [MCQ] {q['text']}  —  ✅ {q['options'][q['correct_index']]}")
+                else:
+                    tag = "auto-graded" if q["expected_answers"] else "manual review"
+                    st.write(f"{i+1}. [Free text — {tag}] {q['text']}")
+            with cols[1]:
+                if st.button("🗑️", key=f"del_{form_key_suffix}_{i}"):
+                    st.session_state[state_key].pop(i)
+                    st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -295,65 +418,12 @@ def admin_create_quiz():
 
     duration = st.number_input(
         "Turnaround time — minutes each person gets once THEY start",
-        min_value=5, max_value=480, value=60, step=5,
+        min_value=5, max_value=480, value=60, step=5, key="create_duration",
     )
-    show_score = st.checkbox("Show participants their score immediately after they submit", value=False)
+    show_score = st.checkbox("Show participants their score immediately after they submit",
+                              value=False, key="create_show_score")
 
-    q_type = st.radio("Question type", ["Multiple choice", "Free text"], horizontal=True)
-
-    with st.form("add_question_form", clear_on_submit=True):
-        st.markdown("**Add a question**")
-        q_text = st.text_area("Question text")
-
-        if q_type == "Multiple choice":
-            opt_a = st.text_input("Option A")
-            opt_b = st.text_input("Option B")
-            opt_c = st.text_input("Option C (optional)")
-            opt_d = st.text_input("Option D (optional)")
-            correct = st.selectbox("Correct answer", ["A", "B", "C", "D"])
-        else:
-            expected_raw = st.text_input(
-                "Expected answer(s) for auto-grading — comma-separated, case-insensitive. "
-                "Leave blank to grade this one manually."
-            )
-
-        add = st.form_submit_button("Add question")
-        if add:
-            if not q_text.strip():
-                st.error("Give the question text.")
-            elif q_type == "Multiple choice":
-                options = [o for o in [opt_a, opt_b, opt_c, opt_d] if o.strip()]
-                if len(options) < 2:
-                    st.error("Give at least 2 options.")
-                else:
-                    correct_index = "ABCD".index(correct)
-                    if correct_index >= len(options):
-                        st.error(f"Option {correct} is empty — pick a correct answer that has text.")
-                    else:
-                        st.session_state.draft_questions.append({
-                            "type": "mcq",
-                            "text": q_text,
-                            "options": options,
-                            "correct_index": correct_index,
-                        })
-                        st.success("Question added.")
-            else:
-                expected = [e.strip() for e in expected_raw.split(",") if e.strip()]
-                st.session_state.draft_questions.append({
-                    "type": "text",
-                    "text": q_text,
-                    "expected_answers": expected,
-                })
-                st.success("Question added." + ("" if expected else " (marked for manual grading)"))
-
-    if st.session_state.draft_questions:
-        st.markdown(f"**Questions so far ({len(st.session_state.draft_questions)}):**")
-        for i, q in enumerate(st.session_state.draft_questions, 1):
-            if q["type"] == "mcq":
-                st.write(f"{i}. [MCQ] {q['text']}  —  ✅ {q['options'][q['correct_index']]}")
-            else:
-                tag = "auto-graded" if q["expected_answers"] else "manual review"
-                st.write(f"{i}. [Free text — {tag}] {q['text']}")
+    question_builder("draft_questions", "create")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -378,6 +448,57 @@ def admin_create_quiz():
                  f"3. They have {duration} minutes from the moment THEY click Start.")
 
 
+def admin_edit_quiz():
+    st.subheader("Edit an existing quiz")
+    quizzes = list_quizzes()
+    if not quizzes:
+        st.info("No quizzes to edit yet — create one first.")
+        return
+
+    options = {f"{q['title']}  ({q['code']})": q["code"] for q in quizzes}
+    choice = st.selectbox("Select a quiz to edit", list(options.keys()), key="edit_select")
+    code = options[choice]
+
+    # (Re)load into session state whenever the selected quiz changes
+    if st.session_state.get("editing_code") != code:
+        quiz = get_quiz(code)
+        st.session_state.editing_code = code
+        st.session_state.edit_title = quiz["title"]
+        st.session_state.edit_duration = quiz["duration_minutes"]
+        st.session_state.edit_show_score = bool(quiz["show_score"])
+        st.session_state.edit_questions = json.loads(quiz["questions_json"])
+
+    attempts = get_all_attempts(code)
+    if attempts:
+        st.warning(
+            f"⚠️ {len(attempts)} participant(s) have already started this quiz. "
+            f"Removing or reordering questions can make their saved answers line up "
+            f"with the wrong question. Adding new questions or fixing typos is safe."
+        )
+
+    st.session_state.edit_title = st.text_input("Quiz title", value=st.session_state.edit_title)
+    st.session_state.edit_duration = st.number_input(
+        "Turnaround time (minutes)", min_value=5, max_value=480,
+        value=st.session_state.edit_duration, step=5,
+    )
+    st.session_state.edit_show_score = st.checkbox(
+        "Show participants their score immediately after they submit",
+        value=st.session_state.edit_show_score,
+    )
+
+    question_builder("edit_questions", "edit")
+
+    if st.button("💾 Save changes", type="primary"):
+        update_quiz(
+            code,
+            st.session_state.edit_title,
+            st.session_state.edit_questions,
+            st.session_state.edit_duration,
+            st.session_state.edit_show_score,
+        )
+        st.success("Quiz updated.")
+
+
 def admin_dashboard():
     st.subheader("📊 Dashboard")
     quizzes = list_quizzes()
@@ -386,7 +507,7 @@ def admin_dashboard():
         return
 
     options = {f"{q['title']}  ({q['code']})": q["code"] for q in quizzes}
-    choice = st.selectbox("Select a quiz", list(options.keys()))
+    choice = st.selectbox("Select a quiz", list(options.keys()), key="dash_select")
     code = options[choice]
     quiz = get_quiz(code)
     questions = json.loads(quiz["questions_json"])
@@ -435,7 +556,6 @@ def admin_dashboard():
             mime="text/csv",
         )
 
-        # Detailed per-question export, including free-text responses for manual grading
         detail_rows = []
         for name, ans in answers_by_participant.items():
             for i, q in enumerate(questions):
@@ -464,15 +584,44 @@ def admin_dashboard():
                 mime="text/csv",
             )
 
+    st.divider()
+    with st.expander("⚠️ Danger zone"):
+        st.write(f"This clears **all attempts and answers** for *{quiz['title']}* ({code}). "
+                 f"The quiz and its questions stay intact — only results are wiped. "
+                 f"This cannot be undone.")
+        confirm = st.checkbox("I understand this permanently deletes all results for this quiz.",
+                               key="confirm_clear")
+        if st.button("🗑️ Clear all results for this quiz", disabled=not confirm):
+            delete_results(code)
+            st.success("Results cleared.")
+            st.rerun()
+
     autorefresh(5000, key="admin_refresh")
 
 
 def admin_view():
-    tab1, tab2 = st.tabs(["➕ Create quiz", "📊 Dashboard"])
+    tab1, tab2, tab3 = st.tabs(["➕ Create quiz", "✏️ Edit quiz", "📊 Dashboard"])
     with tab1:
         admin_create_quiz()
     with tab2:
+        admin_edit_quiz()
+    with tab3:
         admin_dashboard()
+
+
+def admin_gate():
+    st.title("⏱️ Team Quiz — Admin")
+    if st.session_state.get("is_admin_authed"):
+        admin_view()
+        return
+
+    pw = st.text_input("Admin password", type="password")
+    if st.button("Login", type="primary"):
+        if pw == ADMIN_PASSWORD:
+            st.session_state.is_admin_authed = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
 
 
 # --------------------------------------------------------------------------
@@ -520,7 +669,6 @@ def participant_quiz(code, name):
     rem = remaining_seconds(attempt, duration)
     already_submitted = bool(attempt["submitted"])
 
-    # Auto-submit if time is up
     if rem <= 0 and not already_submitted:
         mark_submitted(code, name)
         already_submitted = True
@@ -528,7 +676,7 @@ def participant_quiz(code, name):
     st.subheader(quiz["title"])
 
     if already_submitted:
-        st.success("✅ Submitted. Thanks!")
+        st.success("✅ Your quiz has been submitted. Thanks!")
         if quiz["show_score"]:
             answers = get_answers(code, name)
             correct, auto_total, manual = score_attempt(questions, answers)
@@ -545,9 +693,15 @@ def participant_quiz(code, name):
 
     answers = get_answers(code, name)
 
-    q_labels = [f"Q{i+1}" + (" ✓" if i in answers else "") for i in range(len(questions))]
-    q_idx = st.radio("Jump to question:", list(range(len(questions))),
-                      format_func=lambda i: q_labels[i], horizontal=True)
+    # Sequential navigation state, kept per participant
+    nav_key = f"qidx_{code}_{name}"
+    if nav_key not in st.session_state:
+        st.session_state[nav_key] = 0
+    st.session_state[nav_key] = max(0, min(st.session_state[nav_key], len(questions) - 1))
+    q_idx = st.session_state[nav_key]
+    is_last_question = q_idx == len(questions) - 1
+
+    st.caption(f"Question {q_idx + 1} of {len(questions)}  ·  {len(answers)} answered so far")
 
     q = questions[q_idx]
     st.markdown(f"#### {q['text']}")
@@ -579,17 +733,31 @@ def participant_quiz(code, name):
             save_text_answer(code, name, q_idx, text_val)
             st.rerun()
 
-    st.caption(f"Answered {len(answers)} of {len(questions)} questions.")
-
     st.divider()
-    if st.button("✅ Submit final answers now", type="primary"):
-        mark_submitted(code, name)
-        st.rerun()
+    col_prev, col_next = st.columns(2)
+    with col_prev:
+        if st.button("⬅️ Previous", disabled=(q_idx == 0), use_container_width=True):
+            st.session_state[nav_key] = q_idx - 1
+            st.rerun()
+    with col_next:
+        if not is_last_question:
+            if st.button("Next ➡️", type="primary", use_container_width=True):
+                st.session_state[nav_key] = q_idx + 1
+                st.rerun()
+        else:
+            if st.button("✅ Final Submit", type="primary", use_container_width=True):
+                mark_submitted(code, name)
+                st.rerun()
+
+    if is_last_question and len(answers) < len(questions):
+        st.caption(f"⚠️ {len(questions) - len(answers)} question(s) still unanswered — "
+                    f"Final Submit will send the quiz as-is.")
 
     autorefresh(3000, key="participant_refresh")
 
 
 def participant_view():
+    st.title("⏱️ Team Quiz")
     if "p_code" in st.session_state and "p_name" in st.session_state:
         participant_quiz(st.session_state.p_code, st.session_state.p_name)
     else:
@@ -602,14 +770,12 @@ def participant_view():
 
 def main():
     st.set_page_config(page_title="Timed Quiz", page_icon="⏱️", layout="centered")
+    hide_streamlit_chrome()
     init_db()
 
-    st.title("⏱️ Team Quiz")
-
-    role = st.sidebar.radio("I am a...", ["Participant", "Admin"])
-
-    if role == "Admin":
-        admin_view()
+    is_admin_request = st.query_params.get("admin", "") == "1"
+    if is_admin_request:
+        admin_gate()
     else:
         participant_view()
 
